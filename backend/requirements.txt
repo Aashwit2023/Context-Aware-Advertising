@@ -11,7 +11,8 @@ pydantic
 huggingface_hub
 sentence_transformers
 
+supadata
+requests
 yt-dlp[default]
 yt-dlp-ejs
-youtube-transcript-api
 opencv-python-headless

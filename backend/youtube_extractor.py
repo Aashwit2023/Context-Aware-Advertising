@@ -3,8 +3,8 @@ import cv2
 import json
 import re
 import shutil
+import requests
 import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi
 
 print("========================================")
 print("yt-dlp:", yt_dlp.version.__version__)
@@ -51,6 +51,11 @@ class YouTubeFeatureExtractor:
                 exist_ok=True
             )
 
+        self.supadata_api_key = os.getenv(
+            "SUPADATA_API_KEY",
+            ""
+        ).strip()
+
         # ==========================================================
         # YOUTUBE COOKIES
         # ==========================================================
@@ -92,19 +97,19 @@ class YouTubeFeatureExtractor:
                 )
 
                 print(
-                    "🍪 YouTube cookies loaded successfully."
+                    "[COOKIES] YouTube cookies loaded successfully."
                 )
 
             except Exception as e:
 
                 print(
-                    f"⚠️ Could not copy YouTube cookies: {e}"
+                    f"[!] Could not copy YouTube cookies: {e}"
                 )
 
         else:
 
             print(
-                "⚠️ YouTube cookies file not found."
+                "[!] YouTube cookies file not found."
             )
 
 
@@ -127,30 +132,15 @@ class YouTubeFeatureExtractor:
             - analysis results
         """
 
-        video_path = os.path.join(
-            self.dirs["videos"],
-            f"{video_id}.mp4"
-        )
-
-        if os.path.exists(video_path):
-
-            try:
-
-                os.remove(
-                    video_path
-                )
-
-                print(
-                    f"[CLEANUP] Deleted temporary video: "
-                    f"{video_path}"
-                )
-
-            except Exception as e:
-
-                print(
-                    f"[!] Could not delete video "
-                    f"{video_path}: {e}"
-                )
+        if os.path.exists(self.dirs["videos"]):
+            for f in os.listdir(self.dirs["videos"]):
+                if f.startswith(video_id):
+                    f_path = os.path.join(self.dirs["videos"], f)
+                    try:
+                        os.remove(f_path)
+                        print(f"[CLEANUP] Deleted temporary video: {f_path}")
+                    except Exception as e:
+                        print(f"[!] Could not delete video {f_path}: {e}")
 
 
         frame_dir = os.path.join(
@@ -229,6 +219,11 @@ class YouTubeFeatureExtractor:
             f"https://www.youtube.com/watch?v={video_id}"
         )
 
+        node_bin = shutil.which("node") or "/usr/bin/node"
+        js_runtimes = {}
+        if node_bin:
+            js_runtimes["node"] = {"path": node_bin}
+
         ydl_opts = {
 
             # Prefer low-resolution video because this
@@ -241,7 +236,10 @@ class YouTubeFeatureExtractor:
                 "/worst",
 
             "outtmpl":
-                video_path,
+                os.path.join(self.dirs["videos"], f"{video_id}.%(ext)s"),
+
+            "merge_output_format":
+                "mp4",
 
             "noplaylist":
                 True,
@@ -280,11 +278,7 @@ class YouTubeFeatureExtractor:
                     "en-US,en;q=0.9"
             },
             
-            "js_runtimes": {
-                "node": {
-                    "path": "/usr/bin/node"
-                }
-            },
+            "js_runtimes": js_runtimes,
 
             # Don't force Android/Web clients.
             # Let the current yt-dlp extractor decide.
@@ -480,19 +474,38 @@ class YouTubeFeatureExtractor:
         except Exception as e:
 
             print(
-                f"⚠️ Could not save metadata: {e}"
+                f"[!] Could not save metadata: {e}"
             )
 
+        actual_video_path = None
+        for candidate in [
+            os.path.join(self.dirs["videos"], f"{video_id}.mp4"),
+            os.path.join(self.dirs["videos"], f"{video_id}.webm"),
+            os.path.join(self.dirs["videos"], f"{video_id}.mp4.webm"),
+            os.path.join(self.dirs["videos"], f"{video_id}.mkv")
+        ]:
+            if os.path.exists(candidate):
+                actual_video_path = candidate
+                break
+
+        if not actual_video_path and os.path.exists(self.dirs["videos"]):
+            for f in os.listdir(self.dirs["videos"]):
+                if f.startswith(video_id) and not f.endswith(".part") and not f.endswith(".ytdl"):
+                    actual_video_path = os.path.join(self.dirs["videos"], f)
+                    break
+
+        if not actual_video_path:
+            actual_video_path = os.path.join(self.dirs["videos"], f"{video_id}.mp4")
 
         print(
-            f"[OK] Video saved: {video_path}"
+            f"[OK] Video saved: {actual_video_path}"
         )
 
         print(
             f"[OK] Metadata saved: {metadata_path}"
         )
 
-        return video_path
+        return actual_video_path
 
 
     # ==============================================================
@@ -541,7 +554,8 @@ class YouTubeFeatureExtractor:
     ) -> list:
 
         """
-        Fetch and cache timestamped subtitle transcript.
+        Fetch and cache timestamped subtitle transcript using SupaData.
+        Supports native captions as well as automatic AI (Whisper) transcription fallback.
         """
 
         transcript_path = os.path.join(
@@ -563,145 +577,139 @@ class YouTubeFeatureExtractor:
                     encoding="utf-8"
                 ) as f:
 
-                    return json.load(f)
+                    cached_data = json.load(f)
+                    if cached_data:
+                        print(f"⚡ [CACHE HIT] Loaded transcript for {video_id} ({len(cached_data)} snippets)")
+                        return cached_data
 
             except Exception:
                 pass
 
 
         print(
-            f"\n[2/3] Fetching transcript "
+            f"\n[2/3] Fetching transcript via SupaData "
             f"for: {video_id}..."
         )
 
+        clean_url = f"https://www.youtube.com/watch?v={video_id}"
+        raw_segments = []
 
-        try:
-
-            api = YouTubeTranscriptApi()
-
-
+        # ----------------------------------------------------------
+        # 1. Try Supadata SDK
+        # ----------------------------------------------------------
+        if self.supadata_api_key:
             try:
-
-                raw_transcript = api.fetch(
-                    video_id
+                from supadata import Supadata
+                client = Supadata(api_key=self.supadata_api_key)
+                res = client.transcript(
+                    url=clean_url,
+                    text=False,
+                    mode="auto"
                 )
+                if hasattr(res, "content") and isinstance(res.content, list):
+                    raw_segments = res.content
+                elif isinstance(res, dict) and "content" in res:
+                    raw_segments = res["content"] if isinstance(res["content"], list) else []
+                elif isinstance(res, list):
+                    raw_segments = res
+            except Exception as sdk_err:
+                print(f"[!] Supadata SDK fetch notice: {sdk_err}. Trying direct REST API fallback...")
 
-            except Exception:
-
-                transcript_list = api.list(
-                    video_id
+        # ----------------------------------------------------------
+        # 2. Try Supadata REST API Fallback
+        # ----------------------------------------------------------
+        if not raw_segments and self.supadata_api_key:
+            try:
+                headers = {
+                    "x-api-key": self.supadata_api_key,
+                    "User-Agent": "ContextAwareAds/1.0"
+                }
+                resp = requests.get(
+                    "https://api.supadata.ai/v1/transcript",
+                    headers=headers,
+                    params={
+                        "url": clean_url,
+                        "text": "false",
+                        "mode": "auto"
+                    },
+                    timeout=30
                 )
-
-                transcript_obj = (
-                    transcript_list.find_transcript(
-                        [
-                            "en",
-                            "en-US",
-                            "en-GB",
-                            "hi"
-                        ]
-                    )
-                )
-
-                raw_transcript = (
-                    transcript_obj.fetch()
-                )
-
-
-            formatted = []
-
-
-            for item in raw_transcript:
-
-                if isinstance(
-                    item,
-                    dict
-                ):
-
-                    text = item.get(
-                        "text"
-                    )
-
-                    start = item.get(
-                        "start",
-                        0.0
-                    )
-
-                    duration = item.get(
-                        "duration",
-                        0.0
-                    )
-
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        raw_segments = data.get("content", [])
+                    elif isinstance(data, list):
+                        raw_segments = data
                 else:
+                    print(f"[!] Supadata REST API status {resp.status_code}: {resp.text}")
+            except Exception as rest_err:
+                print(f"[!] Supadata REST API error: {rest_err}")
 
-                    text = getattr(
-                        item,
-                        "text",
-                        None
-                    )
+        if not self.supadata_api_key:
+            print("[!] Warning: SUPADATA_API_KEY is not configured in environment or .env.")
 
-                    start = getattr(
-                        item,
-                        "start",
-                        0.0
-                    )
+        # ----------------------------------------------------------
+        # 3. Format Segments
+        # ----------------------------------------------------------
+        formatted = []
+        for item in raw_segments:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                # Offset / start normalization (ms to seconds)
+                if "offset" in item:
+                    val = float(item["offset"])
+                    start = val / 1000.0 if val > 100 else val
+                else:
+                    val = float(item.get("start", 0.0))
+                    start = val / 1000.0 if val > 1000 else val
 
-                    duration = getattr(
-                        item,
-                        "duration",
-                        0.0
-                    )
+                dur_val = float(item.get("duration", 0.0))
+                duration = dur_val / 1000.0 if dur_val > 500 else dur_val
+            else:
+                text = getattr(item, "text", getattr(item, "content", ""))
+                val = float(getattr(item, "offset", getattr(item, "start", 0.0)))
+                start = val / 1000.0 if val > 100 else val
+                dur_val = float(getattr(item, "duration", 0.0))
+                duration = dur_val / 1000.0 if dur_val > 500 else dur_val
 
-
-                if text:
-
+            if text:
+                clean_text = str(text).replace("\n", " ").strip()
+                if clean_text:
                     formatted.append({
-
-                        "text":
-                            text.replace(
-                                "\n",
-                                " "
-                            ).strip(),
-
-                        "start":
-                            float(start),
-
-                        "duration":
-                            float(duration)
+                        "text": clean_text,
+                        "start": round(float(start), 2),
+                        "duration": round(float(duration), 2)
                     })
 
+        if formatted:
+            try:
+                with open(
+                    transcript_path,
+                    "w",
+                    encoding="utf-8"
+                ) as f:
+                    json.dump(
+                        formatted,
+                        f,
+                        indent=2,
+                        ensure_ascii=False
+                    )
 
-            with open(
-                transcript_path,
-                "w",
-                encoding="utf-8"
-            ) as f:
-
-                json.dump(
-                    formatted,
-                    f,
-                    indent=2,
-                    ensure_ascii=False
+                print(
+                    f"[OK] Transcript saved: "
+                    f"{len(formatted)} snippets "
+                    f"({transcript_path})"
                 )
-
-
-            print(
-                f"[OK] Transcript saved: "
-                f"{len(formatted)} snippets "
-                f"({transcript_path})"
-            )
+            except Exception as save_err:
+                print(f"[!] Could not save transcript cache: {save_err}")
 
             return formatted
 
-
-        except Exception as e:
-
-            print(
-                f"[!] No transcript available "
-                f"for video {video_id}: {e}"
-            )
-
-            return []
+        print(
+            f"[!] No transcript available "
+            f"for video {video_id}"
+        )
+        return []
 
 
     # ==============================================================
